@@ -1,0 +1,13 @@
+[package]
+name = "zond"
+authors = ["nutsalhan87"]
+version = "0.1.0"
+edition = "2021"
+description = "Zond is crate with standard rust collections but with collecting statistics"
+readme = "README.md"
+repository = "https://github.com/nutsalhan87/zond"
+license = "MIT"
+keywords = ["collections"]
+categories = ["data-structures"]
+
+[dependencies]
