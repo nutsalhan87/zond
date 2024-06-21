@@ -1,21 +1,16 @@
 //! [`Vec`]'s analogue with collecting statistics and all corresponding types, structs, traits, etc.
 
 use std::{
-    cell::RefCell,
     collections::TryReserveError,
     mem::MaybeUninit,
     ops::{Bound, Deref, RangeBounds},
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Instant,
     vec::{Drain, Splice},
 };
 
-use crate::{policy::Policy, Operation, OperationType, Operations, ZondCollector};
+use crate::{OperationType, Zond, ZondCollection};
 
-static ID_GENERATOR: AtomicUsize = AtomicUsize::new(0);
-
-/// Describes [`ZVec`]'s operation types or, in other words, called methods
-#[derive(Debug)]
+/// Describes [`ZVec`]'s operation types or, in other words, called methods.
+#[derive(Debug, Clone)]
 pub enum ZVecOperation<T: Clone> {
     New,
     WithCapacity {
@@ -43,7 +38,7 @@ pub enum ZVecOperation<T: Clone> {
     ShrinkTo {
         min_capacity: usize,
     },
-    IntoBoxedSlice, // TODO: проверить, что будет опубликовано при вызове
+    IntoBoxedSlice,
     Truncate {
         len: usize,
     },
@@ -88,7 +83,7 @@ pub enum ZVecOperation<T: Clone> {
     ResizeWith {
         new_len: usize,
     },
-    Leak, // TODO: проверить, что будет опубликовано при вызове
+    Leak,
     SpareCapacityMut,
     Resize {
         new_len: usize,
@@ -107,106 +102,52 @@ pub enum ZVecOperation<T: Clone> {
         end_bound: Bound<usize>,
     },
     Deref,
-    Drop,
+    IntoVec,
+    FromVec {
+        from: Vec<T>,
+    },
 }
 
 impl<T: Clone> OperationType for ZVecOperation<T> {}
 
-impl<T: Clone> Operation<ZVecOperation<T>> {
-    /// Constructs [`Operation`](crate::Operation) with current time and given [`ZVecOperation`] operation type
-    fn new(operation: ZVecOperation<T>) -> Self {
-        Self {
-            instant: Instant::now(),
-            operation,
-        }
-    }
-}
-
-pub type ZVecOperations<T> = Operations<ZVecOperation<T>>;
-
-/// `ZVec` is a wrapper around [`Vec`] providing statistics collecting.
+/// `ZVec` is a wrapper around [`Vec`] providing collecting statistics about operations.
+///
+/// *Attention*. Many `Vec`'s methods are avaliable via an implicit deref() call. So when you call them, only [`Deref`](ZVecOperation::Deref) saved.\
+/// Later I'll implement wrapper around slice for collecting its operations.
 pub struct ZVec<T: Clone> {
-    id: usize,
     inner: Vec<T>,
-    metadata: RefCell<ZVecOperations<T>>,
-    policy: Policy,
-    zond_collector: Box<dyn ZondCollector<ZVecOperation<T>>>,
+    zond_collection: ZondCollection<ZVecOperation<T>>,
 }
 
 impl<T: Clone> ZVec<T> {
-    // Force handle collected operations
-    fn zond_collect(&self) {
-        let metadata = self.metadata.replace(Vec::new());
-        self.zond_collector.zond_collect(self.id, metadata);
-    }
-
-    // Check handling policy and, if accordingly to them operations should be handled, handle operations
-    fn try_zond_collect(&self) {
-        match &self.policy {
-            Policy::OnCountOperations(meta) => {
-                let mut current_operations = meta.current_operations.borrow_mut();
-                if meta.max_operations - 1 == *current_operations {
-                    *current_operations = 0;
-                    self.zond_collect()
-                } else {
-                    *current_operations += 1;
-                }
-            }
-            Policy::LessOften(meta) => {
-                let mut last_collect = meta.last_collect.borrow_mut();
-                let now = Instant::now();
-                if now.duration_since(*last_collect) > meta.duration {
-                    *last_collect = now;
-                    self.zond_collect()
-                }
-            }
-            Policy::OnDropOnly => (),
-        }
-    }
-
-    // Push single operation to store and handle all of them if they should be handled
-    fn push_operation(&self, operation: ZVecOperation<T>) {
-        self.metadata.borrow_mut().push(Operation::new(operation));
-        self.try_zond_collect();
-    }
-}
-
-impl<T: Clone> Drop for ZVec<T> {
-    fn drop(&mut self) {
-        self.push_operation(ZVecOperation::Drop);
-        self.zond_collect();
-    }
-}
-
-impl<T: Clone> ZVec<T> {
-    pub fn new(
-        zond_collector: impl ZondCollector<ZVecOperation<T>> + 'static,
-        policy: Policy,
-    ) -> Self {
+    /// Creates `Zvec` from existing `Vec` instance.
+    pub fn from_vec(from: Vec<T>, zond: Zond<ZVecOperation<T>>) -> Self {
         let zvec = Self {
-            id: ID_GENERATOR.fetch_add(1, Ordering::Relaxed),
-            inner: Vec::new(),
-            metadata: RefCell::default(),
-            policy,
-            zond_collector: Box::new(zond_collector),
+            inner: from,
+            zond_collection: ZondCollection::new(zond),
         };
-        zvec.push_operation(ZVecOperation::New);
+        zvec.zond_collection.push_operation(ZVecOperation::FromVec {
+            from: zvec.inner.clone(),
+        });
         zvec
     }
 
-    pub fn with_capacity(
-        capacity: usize,
-        zond_collector: impl ZondCollector<ZVecOperation<T>> + 'static,
-        policy: Policy,
-    ) -> Self {
+    pub fn new(zond: Zond<ZVecOperation<T>>) -> Self {
         let zvec = Self {
-            id: ID_GENERATOR.fetch_add(1, Ordering::Relaxed),
-            inner: Vec::with_capacity(capacity),
-            metadata: RefCell::default(),
-            policy,
-            zond_collector: Box::new(zond_collector),
+            inner: Vec::new(),
+            zond_collection: ZondCollection::new(zond),
         };
-        zvec.push_operation(ZVecOperation::WithCapacity { capacity });
+        zvec.zond_collection.push_operation(ZVecOperation::New);
+        zvec
+    }
+
+    pub fn with_capacity(capacity: usize, zond: Zond<ZVecOperation<T>>) -> Self {
+        let zvec = Self {
+            inner: Vec::with_capacity(capacity),
+            zond_collection: ZondCollection::new(zond),
+        };
+        zvec.zond_collection
+            .push_operation(ZVecOperation::WithCapacity { capacity });
         zvec
     }
 
@@ -214,101 +155,112 @@ impl<T: Clone> ZVec<T> {
         ptr: *mut T,
         length: usize,
         capacity: usize,
-        zond_collector: impl ZondCollector<ZVecOperation<T>> + 'static,
-        policy: Policy,
+        zond: Zond<ZVecOperation<T>>,
     ) -> Self {
         let zvec = Self {
-            id: ID_GENERATOR.fetch_add(1, Ordering::Relaxed),
             inner: Vec::from_raw_parts(ptr, length, capacity),
-            metadata: RefCell::default(),
-            policy,
-            zond_collector: Box::new(zond_collector),
+            zond_collection: ZondCollection::new(zond),
         };
-        zvec.push_operation(ZVecOperation::FromRawParts {
-            ptr,
-            length,
-            capacity,
-        });
+        zvec.zond_collection
+            .push_operation(ZVecOperation::FromRawParts {
+                ptr,
+                length,
+                capacity,
+            });
         zvec
     }
 
     pub fn capacity(&self) -> usize {
-        self.push_operation(ZVecOperation::Capacity);
+        self.zond_collection.push_operation(ZVecOperation::Capacity);
         self.inner.capacity()
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        self.push_operation(ZVecOperation::Reserve { additional });
+        self.zond_collection
+            .push_operation(ZVecOperation::Reserve { additional });
         self.inner.reserve(additional)
     }
 
     pub fn reserve_exact(&mut self, additional: usize) {
-        self.push_operation(ZVecOperation::ReserveExact { additional });
+        self.zond_collection
+            .push_operation(ZVecOperation::ReserveExact { additional });
         self.inner.reserve_exact(additional)
     }
 
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        self.push_operation(ZVecOperation::TryReserve { additional });
+        self.zond_collection
+            .push_operation(ZVecOperation::TryReserve { additional });
         self.inner.try_reserve(additional)
     }
 
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        self.push_operation(ZVecOperation::TryReserveExact { additional });
+        self.zond_collection
+            .push_operation(ZVecOperation::TryReserveExact { additional });
         self.inner.try_reserve_exact(additional)
     }
 
     pub fn shrink_to_fit(&mut self) {
-        self.push_operation(ZVecOperation::ShrinkToFit);
+        self.zond_collection
+            .push_operation(ZVecOperation::ShrinkToFit);
         self.inner.shrink_to_fit()
     }
 
     pub fn shrink_to(&mut self, min_capacity: usize) {
-        self.push_operation(ZVecOperation::ShrinkTo { min_capacity });
+        self.zond_collection
+            .push_operation(ZVecOperation::ShrinkTo { min_capacity });
         self.inner.shrink_to(min_capacity)
     }
 
     pub fn into_boxed_slice(self) -> Box<[T]> {
-        self.push_operation(ZVecOperation::IntoBoxedSlice);
-        self.inner.to_vec().into_boxed_slice()
+        let ZVec {
+            inner,
+            zond_collection,
+        } = self;
+        zond_collection.push_operation(ZVecOperation::IntoBoxedSlice);
+        inner.into_boxed_slice()
     }
 
     pub fn truncate(&mut self, len: usize) {
-        self.push_operation(ZVecOperation::Truncate { len });
+        self.zond_collection
+            .push_operation(ZVecOperation::Truncate { len });
         self.inner.truncate(len)
     }
 
     pub fn as_slice(&self) -> &[T] {
-        self.push_operation(ZVecOperation::AsSlice);
+        self.zond_collection.push_operation(ZVecOperation::AsSlice);
         self.inner.as_slice()
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        self.push_operation(ZVecOperation::AsMutSlice);
+        self.zond_collection
+            .push_operation(ZVecOperation::AsMutSlice);
         self.inner.as_mut_slice()
     }
 
     pub fn as_ptr(&self) -> *const T {
-        self.push_operation(ZVecOperation::AsPtr);
+        self.zond_collection.push_operation(ZVecOperation::AsPtr);
         self.inner.as_ptr()
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.push_operation(ZVecOperation::AsMutPtr);
+        self.zond_collection.push_operation(ZVecOperation::AsMutPtr);
         self.inner.as_mut_ptr()
     }
 
     pub unsafe fn set_len(&mut self, new_len: usize) {
-        self.push_operation(ZVecOperation::SetLen { new_len });
+        self.zond_collection
+            .push_operation(ZVecOperation::SetLen { new_len });
         self.inner.set_len(new_len)
     }
 
     pub fn swap_remove(&mut self, index: usize) -> T {
-        self.push_operation(ZVecOperation::SwapRemove { index });
+        self.zond_collection
+            .push_operation(ZVecOperation::SwapRemove { index });
         self.inner.swap_remove(index)
     }
 
     pub fn insert(&mut self, index: usize, element: T) {
-        self.push_operation(ZVecOperation::Insert {
+        self.zond_collection.push_operation(ZVecOperation::Insert {
             index,
             element: element.clone(),
         });
@@ -316,7 +268,8 @@ impl<T: Clone> ZVec<T> {
     }
 
     pub fn remove(&mut self, index: usize) -> T {
-        self.push_operation(ZVecOperation::Remove { index });
+        self.zond_collection
+            .push_operation(ZVecOperation::Remove { index });
         self.inner.remove(index)
     }
 
@@ -324,7 +277,7 @@ impl<T: Clone> ZVec<T> {
     where
         F: FnMut(&T) -> bool,
     {
-        self.push_operation(ZVecOperation::Retain);
+        self.zond_collection.push_operation(ZVecOperation::Retain);
         self.inner.retain(f)
     }
 
@@ -332,7 +285,8 @@ impl<T: Clone> ZVec<T> {
     where
         F: FnMut(&mut T) -> bool,
     {
-        self.push_operation(ZVecOperation::RetainMut);
+        self.zond_collection
+            .push_operation(ZVecOperation::RetainMut);
         self.inner.retain_mut(f)
     }
 
@@ -341,7 +295,8 @@ impl<T: Clone> ZVec<T> {
         F: FnMut(&mut T) -> K,
         K: PartialEq,
     {
-        self.push_operation(ZVecOperation::DedupByKey);
+        self.zond_collection
+            .push_operation(ZVecOperation::DedupByKey);
         self.inner.dedup_by_key(key)
     }
 
@@ -349,24 +304,24 @@ impl<T: Clone> ZVec<T> {
     where
         F: FnMut(&mut T, &mut T) -> bool,
     {
-        self.push_operation(ZVecOperation::DedupBy);
+        self.zond_collection.push_operation(ZVecOperation::DedupBy);
         self.inner.dedup_by(same_bucket)
     }
 
     pub fn push(&mut self, value: T) {
-        self.push_operation(ZVecOperation::Push {
+        self.zond_collection.push_operation(ZVecOperation::Push {
             value: value.clone(),
         });
         self.inner.push(value)
     }
 
     pub fn pop(&mut self) -> Option<T> {
-        self.push_operation(ZVecOperation::Pop);
+        self.zond_collection.push_operation(ZVecOperation::Pop);
         self.inner.pop()
     }
 
     pub fn append(&mut self, other: &mut Vec<T>) {
-        self.push_operation(ZVecOperation::Append {
+        self.zond_collection.push_operation(ZVecOperation::Append {
             other: other.clone(),
         });
         self.inner.append(other)
@@ -376,7 +331,7 @@ impl<T: Clone> ZVec<T> {
     where
         R: RangeBounds<usize>,
     {
-        self.push_operation(ZVecOperation::Drain {
+        self.zond_collection.push_operation(ZVecOperation::Drain {
             start_bound: range.start_bound().cloned(),
             end_bound: range.end_bound().cloned(),
         });
@@ -384,22 +339,23 @@ impl<T: Clone> ZVec<T> {
     }
 
     pub fn clear(&mut self) {
-        self.push_operation(ZVecOperation::Clear);
+        self.zond_collection.push_operation(ZVecOperation::Clear);
         self.inner.clear()
     }
 
     pub fn len(&self) -> usize {
-        self.push_operation(ZVecOperation::Len);
+        self.zond_collection.push_operation(ZVecOperation::Len);
         self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.push_operation(ZVecOperation::IsEmpty);
+        self.zond_collection.push_operation(ZVecOperation::IsEmpty);
         self.inner.is_empty()
     }
 
     pub fn split_off(&mut self, at: usize) -> Vec<T> {
-        self.push_operation(ZVecOperation::SplitOff { at });
+        self.zond_collection
+            .push_operation(ZVecOperation::SplitOff { at });
         self.inner.split_off(at)
     }
 
@@ -407,22 +363,28 @@ impl<T: Clone> ZVec<T> {
     where
         F: FnMut() -> T,
     {
-        self.push_operation(ZVecOperation::ResizeWith { new_len });
+        self.zond_collection
+            .push_operation(ZVecOperation::ResizeWith { new_len });
         self.inner.resize_with(new_len, f)
     }
 
     pub fn leak<'a>(self) -> &'a mut [T] {
-        self.push_operation(ZVecOperation::Leak);
-        self.inner.to_vec().leak()
+        let ZVec {
+            inner,
+            zond_collection,
+        } = self;
+        zond_collection.push_operation(ZVecOperation::Leak);
+        inner.leak()
     }
 
     pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
-        self.push_operation(ZVecOperation::SpareCapacityMut);
+        self.zond_collection
+            .push_operation(ZVecOperation::SpareCapacityMut);
         self.inner.spare_capacity_mut()
     }
 
     pub fn resize(&mut self, new_len: usize, value: T) {
-        self.push_operation(ZVecOperation::Resize {
+        self.zond_collection.push_operation(ZVecOperation::Resize {
             new_len,
             value: value.clone(),
         });
@@ -430,9 +392,10 @@ impl<T: Clone> ZVec<T> {
     }
 
     pub fn extend_from_slice(&mut self, other: &[T]) {
-        self.push_operation(ZVecOperation::ExtendFromSlice {
-            other: other.to_vec(),
-        });
+        self.zond_collection
+            .push_operation(ZVecOperation::ExtendFromSlice {
+                other: other.to_vec(),
+            });
         self.inner.extend_from_slice(other)
     }
 
@@ -440,10 +403,11 @@ impl<T: Clone> ZVec<T> {
     where
         R: RangeBounds<usize>,
     {
-        self.push_operation(ZVecOperation::ExtendFromWithin {
-            src_start_bound: src.start_bound().cloned(),
-            src_end_bound: src.end_bound().cloned(),
-        });
+        self.zond_collection
+            .push_operation(ZVecOperation::ExtendFromWithin {
+                src_start_bound: src.start_bound().cloned(),
+                src_end_bound: src.end_bound().cloned(),
+            });
         self.inner.extend_from_within(src)
     }
 
@@ -456,7 +420,7 @@ impl<T: Clone> ZVec<T> {
         R: RangeBounds<usize>,
         I: IntoIterator<Item = T>,
     {
-        self.push_operation(ZVecOperation::Splice {
+        self.zond_collection.push_operation(ZVecOperation::Splice {
             start_bound: range.start_bound().cloned(),
             end_bound: range.end_bound().cloned(),
         });
@@ -469,7 +433,7 @@ where
     T: Clone + PartialEq,
 {
     pub fn dedup(&mut self) {
-        self.push_operation(ZVecOperation::Dedup);
+        self.zond_collection.push_operation(ZVecOperation::Dedup);
         self.inner.dedup()
     }
 }
@@ -478,7 +442,18 @@ impl<T: Clone> Deref for ZVec<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
-        self.push_operation(ZVecOperation::Deref);
+        self.zond_collection.push_operation(ZVecOperation::Deref);
         self.inner.deref()
+    }
+}
+
+impl<T: Clone> From<ZVec<T>> for Vec<T> {
+    fn from(zvec: ZVec<T>) -> Vec<T> {
+        let ZVec {
+            inner,
+            zond_collection,
+        } = zvec;
+        zond_collection.push_operation(ZVecOperation::IntoVec);
+        inner
     }
 }
